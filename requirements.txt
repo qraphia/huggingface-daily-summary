@@ -1,15 +1,6 @@
-# App
-gradio>=4.0.0
-huggingface_hub>=1.2.1
-
-# Data
+gradio>=5.0.0,<6
+huggingface_hub>=1.3.0
 pandas<3
 numpy
 scikit-learn
 tqdm
-
-# Translation (optional toggle in UI)
-transformers>=4.40.0
-sentencepiece
-accelerate
-torch
