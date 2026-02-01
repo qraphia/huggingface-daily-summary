@@ -1,325 +1,411 @@
 import datetime as dt
 import html
-import re
-from functools import lru_cache
-from typing import Any, Dict, List, Tuple
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import gradio as gr
 import requests
 
-APP_TITLE = "HuggingFace Daily Summary"
-APP_DESCRIPTION = (
-    "Fetch Hugging Face Daily Papers for a given UTC date and show heuristic key points."
-)
+
+APP_TITLE = "Hugging Face Daily Papers — Clean Viewer"
 
 DAILY_PAPERS_API = "https://huggingface.co/api/daily_papers"
 HF_PAPER_URL = "https://huggingface.co/papers/{paper_id}"
 ARXIV_ABS_URL = "https://arxiv.org/abs/{paper_id}"
 ARXIV_PDF_URL = "https://arxiv.org/pdf/{paper_id}.pdf"
 
-REQUEST_TIMEOUT_S = 30
-DEFAULT_LIMIT = 5
-MAX_LIMIT = 20
-DEFAULT_POINTS = 4
-MAX_POINTS = 6
-MAX_KEYWORDS = 12
+TOKYO_TZ = ZoneInfo("Asia/Tokyo")
 
-CSS = """
-:root { --card-bd:#e5e7eb; --muted:#6b7280; }
-.container { max-width: 980px; margin: 0 auto; }
-.card {
-  border: 1px solid var(--card-bd);
-  border-radius: 14px;
-  padding: 14px 14px;
-  margin: 12px 0;
-  background: white;
-}
-.title { font-size: 1.05rem; font-weight: 700; margin: 0 0 6px; line-height: 1.35; }
-.meta { color: var(--muted); font-size: 0.92rem; margin: 0 0 8px; }
-.links a { margin-right: 10px; font-size: 0.92rem; text-decoration: none; }
-.badges { margin: 8px 0 10px; }
-.badge {
-  display: inline-block;
-  padding: 2px 8px;
-  margin: 0 6px 6px 0;
-  border-radius: 999px;
-  background: #f3f4f6;
-  border: 1px solid var(--card-bd);
-  font-size: 0.82rem;
-}
-.section { margin-top: 10px; }
-.section h4 { margin: 8px 0 6px; font-size: 0.95rem; }
-ul { margin: 6px 0 0 18px; }
-small.note { color: var(--muted); }
-"""
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 minutes
+HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "25"))
 
 _SESSION = requests.Session()
 _SESSION.headers.update(
     {
-        "User-Agent": "huggingface-daily-summary/2.0 (+https://huggingface.co/spaces/Qraphia/huggingface-daily-summary)"
+        "User-Agent": "qraphia/huggingface-daily-summary (clean; gradio)",
+        "Accept": "application/json",
     }
 )
 
-_RE_LINE_MARKER = re.compile(r"\bL\d+:\s*")
-_RE_BULLET_LINE = re.compile(r"^\s*(?:[-*•–]|(\d+)[\.\)]|\((\d+)\))\s+")
-_RE_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_CACHE: Dict[Tuple[str, int], Tuple[float, List[Dict[str, Any]]]] = {}
+
+CSS = """
+:root{
+  --bg: #f7f8fb;
+  --card: #ffffff;
+  --bd: #e6e8ef;
+  --text: #111827;
+  --muted: #6b7280;
+  --chip: #f3f4f6;
+  --link: #2563eb;
+}
+
+.gradio-container{
+  max-width: 1040px !important;
+}
+
+body{
+  background: var(--bg);
+}
+
+.header h1{
+  margin-bottom: 0.2rem;
+}
+
+.subtle{
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.paper-list{
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.card{
+  background: var(--card);
+  border: 1px solid var(--bd);
+  border-radius: 16px;
+  padding: 14px 14px;
+}
+
+.card:hover{
+  border-color: #d9ddea;
+}
+
+.title{
+  font-size: 1.04rem;
+  font-weight: 700;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.title:hover{
+  text-decoration: underline;
+}
+
+.meta{
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.92rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  align-items: center;
+}
+
+.pill{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  background: var(--chip);
+  border: 1px solid var(--bd);
+  border-radius: 999px;
+  color: #374151;
+  font-size: 0.85rem;
+}
+
+.links{
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.links a{
+  color: var(--link);
+  text-decoration: none;
+  font-size: 0.92rem;
+}
+
+.links a:hover{
+  text-decoration: underline;
+}
+
+.chips{
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip{
+  background: var(--chip);
+  border: 1px solid var(--bd);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.82rem;
+  color: #374151;
+}
+
+details.abstract{
+  margin-top: 10px;
+  border-top: 1px dashed var(--bd);
+  padding-top: 10px;
+}
+
+details.abstract summary{
+  cursor: pointer;
+  font-weight: 650;
+  color: #111827;
+  font-size: 0.95rem;
+}
+
+.abstract-text{
+  margin-top: 8px;
+  color: #111827;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.small-muted{
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+"""
 
 
-def utc_today_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+def today_in_tokyo_iso() -> str:
+    return dt.datetime.now(TOKYO_TZ).date().isoformat()
 
 
-def esc(text: str) -> str:
-    return html.escape(text or "", quote=True)
+def escape(s: str) -> str:
+    return html.escape(s or "", quote=True)
 
 
-def normalize_text(text: str) -> str:
+def normalize_abstract(text: str) -> str:
     if not text:
         return ""
-    text = _RE_LINE_MARKER.sub("", text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
+    # HF daily_papers sometimes includes "L1:" line markers
+    out = text.replace("\r\n", "\n").replace("\r", "\n")
+    out = out.strip()
+    # remove "L1:" / "L2:" markers at word boundaries
+    # (avoid importing re to keep this file compact)
+    # simple loop is fine because these markers are short
+    for i in range(1, 50):
+        out = out.replace(f"L{i}:", "")
+    # normalize extra blank lines
+    while "\n\n\n" in out:
+        out = out.replace("\n\n\n", "\n\n")
+    return out.strip()
 
 
-def extract_key_points(text: str, max_points: int) -> List[str]:
-    """
-    Heuristic extraction:
-      1) If bullet-like lines exist, take the first max_points of them.
-      2) Else, split into sentences and take the first max_points sentences.
-    """
-    text = normalize_text(text)
-    if not text:
-        return []
-
-    # Prefer bullet-like lines if present
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    bullet_lines: List[str] = []
-    for ln in lines:
-        if _RE_BULLET_LINE.search(ln):
-            ln = _RE_BULLET_LINE.sub("", ln).strip()
-            if ln:
-                bullet_lines.append(ln)
-
-    if bullet_lines:
-        return [trim_point(p) for p in bullet_lines[:max_points]]
-
-    # Fallback: sentence-ish split
-    sents = [s.strip() for s in _RE_SENT_SPLIT.split(text) if s.strip()]
-    if not sents:
-        return []
-    return [trim_point(s) for s in sents[:max_points]]
+def format_authors(authors: List[Dict[str, Any]], max_names: int = 8) -> Tuple[str, str]:
+    names = [str(a.get("name", "")).strip() for a in (authors or []) if a.get("name")]
+    if not names:
+        return "", ""
+    short = ", ".join(names[:max_names])
+    if len(names) > max_names:
+        short = f"{short}, et al. (+{len(names) - max_names})"
+    full = ", ".join(names)
+    return short, full
 
 
-def trim_point(text: str, max_len: int = 260) -> str:
-    text = (text or "").strip()
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1].rstrip() + "…"
+def fetch_daily_papers(date_str: str, limit: int) -> List[Dict[str, Any]]:
+    key = (date_str, int(limit))
+    now = time.time()
 
+    hit = _CACHE.get(key)
+    if hit and (now - hit[0] < CACHE_TTL_SECONDS):
+        return hit[1]
 
-def format_authors(authors_any: Any, max_names: int = 8) -> Tuple[str, str]:
-    """
-    Returns (short, full). Accepts the API's typical list-of-dicts authors format.
-    """
-    if not isinstance(authors_any, list):
-        return ("", "")
-    names = []
-    for a in authors_any:
-        if isinstance(a, dict):
-            n = (a.get("name") or "").strip()
-            if n:
-                names.append(n)
-
-    # De-duplicate while preserving order
-    seen = set()
-    uniq = []
-    for n in names:
-        if n not in seen:
-            uniq.append(n)
-            seen.add(n)
-
-    if not uniq:
-        return ("", "")
-
-    full = ", ".join(uniq)
-    if len(uniq) <= max_names:
-        return (full, full)
-
-    short = ", ".join(uniq[:max_names]) + f", et al. (+{len(uniq) - max_names})"
-    return (short, full)
-
-
-@lru_cache(maxsize=64)
-def fetch_daily_papers(date_iso: str, limit: int) -> List[Dict[str, Any]]:
-    params = {"date": date_iso, "limit": int(limit), "sort": "trending"}
-    r = _SESSION.get(DAILY_PAPERS_API, params=params, timeout=REQUEST_TIMEOUT_S)
+    params = {"date": date_str, "limit": int(limit), "sort": "trending"}
+    r = _SESSION.get(DAILY_PAPERS_API, params=params, timeout=HTTP_TIMEOUT_SECONDS)
     r.raise_for_status()
+
     data = r.json()
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        data = []
+
+    _CACHE[key] = (now, data)
+    return data
 
 
-def render_card(
-    idx: int,
-    paper_id: str,
-    title: str,
-    upvotes: Any,
-    authors_short: str,
-    authors_full: str,
-    keywords: Any,
-    points: List[str],
-) -> str:
-    paper_id = (paper_id or "").strip()
-    hf_url = HF_PAPER_URL.format(paper_id=paper_id) if paper_id else ""
-    arxiv_abs = ARXIV_ABS_URL.format(paper_id=paper_id) if paper_id else ""
-    arxiv_pdf = ARXIV_PDF_URL.format(paper_id=paper_id) if paper_id else ""
+def apply_query_filter(items: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    q = (query or "").strip().lower()
+    if not q:
+        return items
 
-    links = []
-    if hf_url:
-        links.append(f"<a href='{esc(hf_url)}' target='_blank' rel='noopener'>HF Paper</a>")
-    if arxiv_abs:
-        links.append(f"<a href='{esc(arxiv_abs)}' target='_blank' rel='noopener'>arXiv</a>")
-    if arxiv_pdf:
-        links.append(f"<a href='{esc(arxiv_pdf)}' target='_blank' rel='noopener'>PDF</a>")
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        paper = (it or {}).get("paper") or {}
+        title = str(it.get("title") or paper.get("title") or "")
+        abstract = str(it.get("summary") or paper.get("summary") or "")
+        authors = paper.get("authors") or []
+        author_text = " ".join([str(a.get("name", "")).lower() for a in authors if a.get("name")])
+        keywords = paper.get("ai_keywords") or []
+        kw_text = " ".join([str(k).lower() for k in keywords])
 
-    meta_bits = []
-    if upvotes is not None:
-        meta_bits.append(f"▲ {esc(str(upvotes))}")
-    if authors_short:
-        meta_bits.append(esc(authors_short))
-
-    badges = ""
-    if isinstance(keywords, list) and keywords:
-        badges = "".join(
-            [f"<span class='badge'>{esc(str(k))}</span>" for k in keywords[:MAX_KEYWORDS]]
-        )
-
-    points_html = ""
-    if points:
-        li = "".join([f"<li>{esc(p)}</li>" for p in points])
-        points_html = f"<div class='section'><h4>Key points</h4><ul>{li}</ul></div>"
-
-    authors_details = ""
-    if authors_full and (len(authors_full) > len(authors_short) + 10):
-        authors_details = (
-            "<details style='margin-top:10px;'>"
-            "<summary><small>Full authors</small></summary>"
-            f"<div class='meta' style='margin-top:6px;'>{esc(authors_full)}</div>"
-            "</details>"
-        )
-
-    return (
-        "<div class='card'>"
-        f"<div class='title'>{idx}. {esc(title) if title else '(no title)'}</div>"
-        f"<div class='meta'>{' · '.join(meta_bits)}</div>" if meta_bits else ""
-    ) + (
-        f"<div class='links'>{' '.join(links)}</div>" if links else ""
-    ) + (
-        f"<div class='badges'>{badges}</div>" if badges else ""
-    ) + (
-        points_html
-    ) + (
-        authors_details
-    ) + "</div>"
+        hay = f"{title}\n{abstract}\n{author_text}\n{kw_text}".lower()
+        if q in hay:
+            out.append(it)
+    return out
 
 
-def build_view(date_iso: str, limit: int, points_per_paper: int) -> Tuple[str, str]:
-    date_iso = (date_iso or "").strip()
+def render_cards(
+    date_str: str,
+    limit: int,
+    query: str,
+    show_keywords: bool,
+    show_full_authors: bool,
+) -> Tuple[str, str]:
     try:
-        dt.date.fromisoformat(date_iso)
+        dt.date.fromisoformat(date_str)
     except Exception:
-        return ("", f"❌ Invalid date: `{date_iso}`. Use `YYYY-MM-DD` (UTC).")
-
-    limit = int(limit)
-    limit = max(1, min(MAX_LIMIT, limit))
-
-    points_per_paper = int(points_per_paper)
-    points_per_paper = max(1, min(MAX_POINTS, points_per_paper))
+        return "", f"❌ Invalid date: `{date_str}`. Use YYYY-MM-DD."
 
     try:
-        items = fetch_daily_papers(date_iso, limit)
+        items = fetch_daily_papers(date_str, limit)
     except requests.HTTPError as e:
-        return ("", f"❌ Request failed (HTTP): `{str(e)}`")
-    except requests.RequestException as e:
-        return ("", f"❌ Request failed: `{type(e).__name__}`")
+        return "", f"❌ API error: {type(e).__name__}"
+    except Exception as e:
+        return "", f"❌ Unexpected error: {type(e).__name__}"
 
+    items = apply_query_filter(items, query)
     if not items:
-        empty = (
-            "<div class='container'>"
-            "<p class='meta'>No papers returned for that date. "
-            "Try another UTC date.</p>"
-            "</div>"
-        )
-        return (empty, f"0 papers for `{date_iso}` (UTC).")
+        return "<div class='paper-list'></div>", "No results."
 
-    cards: List[str] = ["<div class='container'>"]
+    blocks: List[str] = ["<div class='paper-list'>"]
+
     for idx, it in enumerate(items, start=1):
         paper = (it or {}).get("paper") or {}
 
         paper_id = str(paper.get("id") or it.get("id") or "").strip()
-        title = (it.get("title") or paper.get("title") or "").strip()
-
-        summary = it.get("summary") or paper.get("summary") or ""
-        ai_summary = paper.get("ai_summary") or ""
-        text_for_points = summary or ai_summary or ""
-
-        points = extract_key_points(text_for_points, max_points=points_per_paper)
-
+        title = str(it.get("title") or paper.get("title") or "").strip() or "(no title)"
         upvotes = paper.get("upvotes")
-        keywords = paper.get("ai_keywords") or []
-        authors_short, authors_full = format_authors(paper.get("authors") or [])
+        upvotes_text = str(upvotes) if upvotes is not None else "—"
 
-        cards.append(
-            render_card(
-                idx=idx,
-                paper_id=paper_id,
-                title=title,
-                upvotes=upvotes,
-                authors_short=authors_short,
-                authors_full=authors_full,
-                keywords=keywords,
-                points=points,
+        authors_short, authors_full = format_authors(paper.get("authors") or [])
+        abstract = normalize_abstract(str(it.get("summary") or paper.get("summary") or ""))
+
+        hf_url = HF_PAPER_URL.format(paper_id=paper_id) if paper_id else ""
+        arxiv_abs = ARXIV_ABS_URL.format(paper_id=paper_id) if paper_id else ""
+        arxiv_pdf = ARXIV_PDF_URL.format(paper_id=paper_id) if paper_id else ""
+
+        title_link = hf_url if hf_url else (arxiv_abs if arxiv_abs else "")
+        title_html = escape(title)
+
+        links: List[str] = []
+        if hf_url:
+            links.append(f"<a href='{escape(hf_url)}' target='_blank' rel='noopener'>HF Paper</a>")
+        if arxiv_abs:
+            links.append(f"<a href='{escape(arxiv_abs)}' target='_blank' rel='noopener'>arXiv</a>")
+        if arxiv_pdf:
+            links.append(f"<a href='{escape(arxiv_pdf)}' target='_blank' rel='noopener'>PDF</a>")
+
+        link_row = f"<div class='links'>{''.join(links)}</div>" if links else ""
+
+        kw_html = ""
+        if show_keywords:
+            keywords = paper.get("ai_keywords") or []
+            if isinstance(keywords, list) and keywords:
+                chips = "".join([f"<span class='chip'>{escape(str(k))}</span>" for k in keywords[:18]])
+                kw_html = f"<div class='chips'>{chips}</div>"
+
+        author_html = ""
+        if authors_short:
+            author_html = f"<span class='pill'>Authors: {escape(authors_short)}</span>"
+
+        full_authors_html = ""
+        if show_full_authors and authors_full and authors_full != authors_short:
+            full_authors_html = (
+                "<div style='margin-top:8px;'>"
+                f"<div class='small-muted'>Full authors</div>"
+                f"<div class='small-muted'>{escape(authors_full)}</div>"
+                "</div>"
             )
+
+        abstract_html = (
+            f"<div class='abstract-text'>{escape(abstract)}</div>"
+            if abstract
+            else "<div class='abstract-text'><span class='small-muted'>No abstract provided.</span></div>"
         )
 
-    cards.append("</div>")
-    status = f"✅ Loaded {len(items)} papers for `{date_iso}` (UTC)."
-    return ("\n".join(cards), status)
+        if title_link:
+            title_node = f"<a class='title' href='{escape(title_link)}' target='_blank' rel='noopener'>{idx}. {title_html}</a>"
+        else:
+            title_node = f"<span class='title'>{idx}. {title_html}</span>"
+
+        blocks.append(
+            "<article class='card'>"
+            f"{title_node}"
+            "<div class='meta'>"
+            f"<span class='pill'>Upvotes: {escape(upvotes_text)}</span>"
+            f"{author_html}"
+            "</div>"
+            f"{link_row}"
+            f"{kw_html}"
+            "<details class='abstract' open>"
+            "<summary>Abstract</summary>"
+            f"{abstract_html}"
+            f"{full_authors_html}"
+            "</details>"
+            "</article>"
+        )
+
+    blocks.append("</div>")
+    status = f"Showing {len(items)} paper(s) for {date_str}."
+    if query.strip():
+        status += f" Filter: “{query.strip()}”."
+    return "\n".join(blocks), status
 
 
-with gr.Blocks() as demo:
-    gr.Markdown(f"# {APP_TITLE}\n{APP_DESCRIPTION}")
+with gr.Blocks(title=APP_TITLE, css=CSS, theme=gr.themes.Soft()) as demo:
+    gr.HTML(
+        "<div class='header'>"
+        f"<h1>{escape(APP_TITLE)}</h1>"
+        "<div class='subtle'>"
+        "A slim viewer for Hugging Face Daily Papers. No translation, no heuristics: show the full abstract."
+        "</div>"
+        "</div>"
+    )
 
     with gr.Row():
-        date_in = gr.Textbox(
-            label="Date (YYYY-MM-DD, UTC)",
-            value=utc_today_iso(),
-            max_lines=1,
-        )
-        limit_in = gr.Slider(
-            label="Limit",
-            minimum=1,
-            maximum=MAX_LIMIT,
-            step=1,
-            value=DEFAULT_LIMIT,
-        )
-        points_in = gr.Slider(
-            label="Key points per paper",
-            minimum=1,
-            maximum=MAX_POINTS,
-            step=1,
-            value=DEFAULT_POINTS,
-        )
-        run_btn = gr.Button("Run", variant="primary")
+        date_in = gr.Textbox(label="Date (YYYY-MM-DD)", value=today_in_tokyo_iso(), max_lines=1)
+        limit_in = gr.Slider(label="Limit", minimum=1, maximum=30, step=1, value=8)
+
+    with gr.Row():
+        query_in = gr.Textbox(label="Search (title / abstract / authors / keywords)", value="", max_lines=1)
+    with gr.Row():
+        show_kw_in = gr.Checkbox(label="Show keywords", value=True)
+        show_full_authors_in = gr.Checkbox(label="Show full author list", value=False)
+
+    with gr.Row():
+        fetch_btn = gr.Button("Fetch", variant="primary")
+        clear_btn = gr.Button("Clear search")
 
     status_out = gr.Markdown()
     html_out = gr.HTML()
 
-    run_btn.click(
-        fn=build_view,
-        inputs=[date_in, limit_in, points_in],
+    fetch_btn.click(
+        fn=render_cards,
+        inputs=[date_in, limit_in, query_in, show_kw_in, show_full_authors_in],
         outputs=[html_out, status_out],
     )
 
-demo.launch(theme=gr.themes.Soft(), css=CSS, ssr_mode=False)
+    clear_btn.click(
+        fn=lambda: "",
+        inputs=[],
+        outputs=[query_in],
+    ).then(
+        fn=render_cards,
+        inputs=[date_in, limit_in, query_in, show_kw_in, show_full_authors_in],
+        outputs=[html_out, status_out],
+    )
+
+    demo.load(
+        fn=render_cards,
+        inputs=[date_in, limit_in, query_in, show_kw_in, show_full_authors_in],
+        outputs=[html_out, status_out],
+    )
+
+if __name__ == "__main__":
+    demo.queue()
+    demo.launch()
