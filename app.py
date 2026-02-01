@@ -1,25 +1,28 @@
-import os
-import re
-import html
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+import html
+import re
+from functools import lru_cache
+from typing import Any, Dict, List, Tuple
 
-import requests
 import gradio as gr
-from huggingface_hub import InferenceClient
+import requests
 
 APP_TITLE = "HuggingFace Daily Summary"
+APP_DESCRIPTION = (
+    "Fetch Hugging Face Daily Papers for a given UTC date and show heuristic key points."
+)
 
 DAILY_PAPERS_API = "https://huggingface.co/api/daily_papers"
 HF_PAPER_URL = "https://huggingface.co/papers/{paper_id}"
 ARXIV_ABS_URL = "https://arxiv.org/abs/{paper_id}"
 ARXIV_PDF_URL = "https://arxiv.org/pdf/{paper_id}.pdf"
 
-# ✅ NLLB はあなたの環境で 404 になっているので使わない
-TRANSLATION_MODEL = "LiquidAI/LFM2-350M-ENJP-MT"
-
-# Space Secrets (and local env) should provide this
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+REQUEST_TIMEOUT_S = 30
+DEFAULT_LIMIT = 5
+MAX_LIMIT = 20
+DEFAULT_POINTS = 4
+MAX_POINTS = 6
+MAX_KEYWORDS = 12
 
 CSS = """
 :root { --card-bd:#e5e7eb; --muted:#6b7280; }
@@ -31,9 +34,9 @@ CSS = """
   margin: 12px 0;
   background: white;
 }
-.title { font-size: 1.05rem; font-weight: 700; margin: 0 0 6px; }
+.title { font-size: 1.05rem; font-weight: 700; margin: 0 0 6px; line-height: 1.35; }
 .meta { color: var(--muted); font-size: 0.92rem; margin: 0 0 8px; }
-.links a { margin-right: 10px; font-size: 0.92rem; }
+.links a { margin-right: 10px; font-size: 0.92rem; text-decoration: none; }
 .badges { margin: 8px 0 10px; }
 .badge {
   display: inline-block;
@@ -50,245 +53,263 @@ ul { margin: 6px 0 0 18px; }
 small.note { color: var(--muted); }
 """
 
-# ---------- text utils ----------
-_JP_CHAR = r"\u3040-\u30FF\u4E00-\u9FFF\u3000-\u303F"
-def _normalize_summary(s: str) -> str:
-    if not s:
-        return ""
-    # Remove "L1:" like markers from HF daily_papers
-    s = re.sub(r"\bL\d+:\s*", "", s)
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return s
+_SESSION = requests.Session()
+_SESSION.headers.update(
+    {
+        "User-Agent": "huggingface-daily-summary/2.0 (+https://huggingface.co/spaces/Qraphia/huggingface-daily-summary)"
+    }
+)
 
-def _extract_bullets(summary: str, max_bullets: int = 4) -> List[str]:
+_RE_LINE_MARKER = re.compile(r"\bL\d+:\s*")
+_RE_BULLET_LINE = re.compile(r"^\s*(?:[-*•–]|(\d+)[\.\)]|\((\d+)\))\s+")
+_RE_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def utc_today_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+
+def esc(text: str) -> str:
+    return html.escape(text or "", quote=True)
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = _RE_LINE_MARKER.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def extract_key_points(text: str, max_points: int) -> List[str]:
     """
-    Heuristic:
-    - If pattern like (1) ... (2) ... exists, split by it
-    - else split by sentences and take first few
+    Heuristic extraction:
+      1) If bullet-like lines exist, take the first max_points of them.
+      2) Else, split into sentences and take the first max_points sentences.
     """
-    summary = _normalize_summary(summary)
-    if not summary:
+    text = normalize_text(text)
+    if not text:
         return []
 
-    # Try "(1) ... (2) ..." style
-    parts = re.split(r"\(\d+\)\s*", summary)
-    if len(parts) >= 3:
-        # parts[0] is preface
-        bullets = [p.strip(" .;\n") for p in parts[1:] if p.strip()]
-        bullets = bullets[:max_bullets]
-        return bullets
+    # Prefer bullet-like lines if present
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    bullet_lines: List[str] = []
+    for ln in lines:
+        if _RE_BULLET_LINE.search(ln):
+            ln = _RE_BULLET_LINE.sub("", ln).strip()
+            if ln:
+                bullet_lines.append(ln)
+
+    if bullet_lines:
+        return [trim_point(p) for p in bullet_lines[:max_points]]
 
     # Fallback: sentence-ish split
-    s = re.sub(r"\s+", " ", summary).strip()
-    # split by ., !, ?, 。, ！, ？
-    sent = re.split(r"(?<=[\.\!\?\。\！\？])\s+", s)
-    sent = [x.strip() for x in sent if x.strip()]
-    return sent[:max_bullets]
+    sents = [s.strip() for s in _RE_SENT_SPLIT.split(text) if s.strip()]
+    if not sents:
+        return []
+    return [trim_point(s) for s in sents[:max_points]]
 
-def _format_authors(authors: List[Dict[str, Any]], max_names: int = 8) -> Tuple[str, str]:
-    names = [a.get("name", "").strip() for a in (authors or []) if a.get("name")]
-    if not names:
+
+def trim_point(text: str, max_len: int = 260) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def format_authors(authors_any: Any, max_names: int = 8) -> Tuple[str, str]:
+    """
+    Returns (short, full). Accepts the API's typical list-of-dicts authors format.
+    """
+    if not isinstance(authors_any, list):
         return ("", "")
-    short = ", ".join(names[:max_names]) + (f", et al. (+{len(names)-max_names})" if len(names) > max_names else "")
-    full = ", ".join(names)
+    names = []
+    for a in authors_any:
+        if isinstance(a, dict):
+            n = (a.get("name") or "").strip()
+            if n:
+                names.append(n)
+
+    # De-duplicate while preserving order
+    seen = set()
+    uniq = []
+    for n in names:
+        if n not in seen:
+            uniq.append(n)
+            seen.add(n)
+
+    if not uniq:
+        return ("", "")
+
+    full = ", ".join(uniq)
+    if len(uniq) <= max_names:
+        return (full, full)
+
+    short = ", ".join(uniq[:max_names]) + f", et al. (+{len(uniq) - max_names})"
     return (short, full)
 
-def _clean_ja_spacing(text: str) -> str:
-    """
-    Remove spurious spaces between Japanese characters/punctuations (common MT artifact).
-    Won't fix semantic garbage, but improves readability when MT is basically correct.
-    """
-    if not text:
-        return ""
-    # remove spaces between Japanese chars
-    text = re.sub(rf"(?<=[{_JP_CHAR}])\s+(?=[{_JP_CHAR}])", "", text)
-    # remove spaces before Japanese punctuation
-    text = re.sub(r"\s+([、。．，！？：；）】』」〉》])", r"\1", text)
-    return text.strip()
 
-# ---------- HF translation ----------
-_TRANSLATOR: Optional[InferenceClient] = None
-_TRANSLATION_CACHE: Dict[str, str] = {}
-
-def _get_translator() -> Optional[InferenceClient]:
-    global _TRANSLATOR
-    if not HF_TOKEN:
-        return None
-    if _TRANSLATOR is None:
-        # provider must be hf-inference for translation() in huggingface_hub
-        _TRANSLATOR = InferenceClient(provider="hf-inference", token=HF_TOKEN, timeout=60)
-    return _TRANSLATOR
-
-def translate_en_to_ja(text: str) -> str:
-    """
-    Robust: never crash the app. If translation fails, return empty string.
-    """
-    text = (text or "").strip()
-    if not text:
-        return ""
-    if text in _TRANSLATION_CACHE:
-        return _TRANSLATION_CACHE[text]
-
-    client = _get_translator()
-    if client is None:
-        return ""
-
-    try:
-        out = client.translation(text, model=TRANSLATION_MODEL)
-        # out can be str / dict-like / object depending on client version
-        if isinstance(out, str):
-            ja = out
-        elif isinstance(out, dict):
-            ja = out.get("translation_text") or out.get("generated_text") or str(out)
-        else:
-            ja = getattr(out, "translation_text", None) or getattr(out, "generated_text", None) or str(out)
-
-        ja = _clean_ja_spacing(ja)
-        _TRANSLATION_CACHE[text] = ja
-        return ja
-    except Exception:
-        # Fail closed: no Japanese rather than broken app
-        return ""
-
-def translate_bullets(bullets: List[str]) -> List[str]:
-    if not bullets:
-        return []
-    # Batch translate as a single block to reduce calls
-    block = "\n".join([f"- {b}" for b in bullets])
-    ja_block = translate_en_to_ja(block)
-    if not ja_block:
-        return []
-    # Try to split back into lines
-    lines = [re.sub(r"^\s*[-•]\s*", "", ln).strip() for ln in ja_block.splitlines() if ln.strip()]
-    return lines[: len(bullets)] if lines else []
-
-# ---------- data fetch ----------
-def fetch_daily_papers(date_str: str, limit: int) -> List[Dict[str, Any]]:
-    params = {"date": date_str, "limit": int(limit), "sort": "trending"}
-    r = requests.get(DAILY_PAPERS_API, params=params, timeout=30)
+@lru_cache(maxsize=64)
+def fetch_daily_papers(date_iso: str, limit: int) -> List[Dict[str, Any]]:
+    params = {"date": date_iso, "limit": int(limit), "sort": "trending"}
+    r = _SESSION.get(DAILY_PAPERS_API, params=params, timeout=REQUEST_TIMEOUT_S)
     r.raise_for_status()
     data = r.json()
-    if not isinstance(data, list):
-        return []
-    return data
+    return data if isinstance(data, list) else []
 
-def build_cards(date_str: str, limit: int, lang: str) -> Tuple[str, str]:
-    """
-    Returns: (html, status_md)
-    """
-    # Validate date
+
+def render_card(
+    idx: int,
+    paper_id: str,
+    title: str,
+    upvotes: Any,
+    authors_short: str,
+    authors_full: str,
+    keywords: Any,
+    points: List[str],
+) -> str:
+    paper_id = (paper_id or "").strip()
+    hf_url = HF_PAPER_URL.format(paper_id=paper_id) if paper_id else ""
+    arxiv_abs = ARXIV_ABS_URL.format(paper_id=paper_id) if paper_id else ""
+    arxiv_pdf = ARXIV_PDF_URL.format(paper_id=paper_id) if paper_id else ""
+
+    links = []
+    if hf_url:
+        links.append(f"<a href='{esc(hf_url)}' target='_blank' rel='noopener'>HF Paper</a>")
+    if arxiv_abs:
+        links.append(f"<a href='{esc(arxiv_abs)}' target='_blank' rel='noopener'>arXiv</a>")
+    if arxiv_pdf:
+        links.append(f"<a href='{esc(arxiv_pdf)}' target='_blank' rel='noopener'>PDF</a>")
+
+    meta_bits = []
+    if upvotes is not None:
+        meta_bits.append(f"▲ {esc(str(upvotes))}")
+    if authors_short:
+        meta_bits.append(esc(authors_short))
+
+    badges = ""
+    if isinstance(keywords, list) and keywords:
+        badges = "".join(
+            [f"<span class='badge'>{esc(str(k))}</span>" for k in keywords[:MAX_KEYWORDS]]
+        )
+
+    points_html = ""
+    if points:
+        li = "".join([f"<li>{esc(p)}</li>" for p in points])
+        points_html = f"<div class='section'><h4>Key points</h4><ul>{li}</ul></div>"
+
+    authors_details = ""
+    if authors_full and (len(authors_full) > len(authors_short) + 10):
+        authors_details = (
+            "<details style='margin-top:10px;'>"
+            "<summary><small>Full authors</small></summary>"
+            f"<div class='meta' style='margin-top:6px;'>{esc(authors_full)}</div>"
+            "</details>"
+        )
+
+    return (
+        "<div class='card'>"
+        f"<div class='title'>{idx}. {esc(title) if title else '(no title)'}</div>"
+        f"<div class='meta'>{' · '.join(meta_bits)}</div>" if meta_bits else ""
+    ) + (
+        f"<div class='links'>{' '.join(links)}</div>" if links else ""
+    ) + (
+        f"<div class='badges'>{badges}</div>" if badges else ""
+    ) + (
+        points_html
+    ) + (
+        authors_details
+    ) + "</div>"
+
+
+def build_view(date_iso: str, limit: int, points_per_paper: int) -> Tuple[str, str]:
+    date_iso = (date_iso or "").strip()
     try:
-        dt.date.fromisoformat(date_str)
+        dt.date.fromisoformat(date_iso)
     except Exception:
-        return ("", f"❌ 日付形式が不正です: `{date_str}`（YYYY-MM-DD で入力してください）")
+        return ("", f"❌ Invalid date: `{date_iso}`. Use `YYYY-MM-DD` (UTC).")
+
+    limit = int(limit)
+    limit = max(1, min(MAX_LIMIT, limit))
+
+    points_per_paper = int(points_per_paper)
+    points_per_paper = max(1, min(MAX_POINTS, points_per_paper))
 
     try:
-        items = fetch_daily_papers(date_str, limit)
-    except Exception as e:
-        return ("", f"❌ daily_papers API の取得に失敗: `{type(e).__name__}`")
+        items = fetch_daily_papers(date_iso, limit)
+    except requests.HTTPError as e:
+        return ("", f"❌ Request failed (HTTP): `{str(e)}`")
+    except requests.RequestException as e:
+        return ("", f"❌ Request failed: `{type(e).__name__}`")
 
-    want_ja = (lang == "日本語（要約+翻訳）")
-    if want_ja and not HF_TOKEN:
-        # Don’t crash; just warn and show English only
-        status = "⚠️ `HF_TOKEN` が未設定なので日本語翻訳はスキップしました（Space Secrets に `HF_TOKEN` を入れてください）。"
-        want_ja = False
-    else:
-        status = "✅ 取得完了"
+    if not items:
+        empty = (
+            "<div class='container'>"
+            "<p class='meta'>No papers returned for that date. "
+            "Try another UTC date.</p>"
+            "</div>"
+        )
+        return (empty, f"0 papers for `{date_iso}` (UTC).")
 
-    cards_html = ["<div class='container'>"]
+    cards: List[str] = ["<div class='container'>"]
     for idx, it in enumerate(items, start=1):
         paper = (it or {}).get("paper") or {}
-        paper_id = paper.get("id") or it.get("id") or ""
+
+        paper_id = str(paper.get("id") or it.get("id") or "").strip()
         title = (it.get("title") or paper.get("title") or "").strip()
+
         summary = it.get("summary") or paper.get("summary") or ""
         ai_summary = paper.get("ai_summary") or ""
-        keywords = paper.get("ai_keywords") or []
+        text_for_points = summary or ai_summary or ""
+
+        points = extract_key_points(text_for_points, max_points=points_per_paper)
+
         upvotes = paper.get("upvotes")
-        authors = paper.get("authors") or []
-        authors_short, authors_full = _format_authors(authors)
+        keywords = paper.get("ai_keywords") or []
+        authors_short, authors_full = format_authors(paper.get("authors") or [])
 
-        bullets_en = _extract_bullets(summary, max_bullets=4)
-        if not bullets_en and ai_summary:
-            bullets_en = _extract_bullets(ai_summary, max_bullets=3)
-
-        bullets_ja = translate_bullets(bullets_en) if want_ja else []
-
-        hf_url = HF_PAPER_URL.format(paper_id=paper_id) if paper_id else ""
-        arxiv_abs = ARXIV_ABS_URL.format(paper_id=paper_id) if paper_id else ""
-        arxiv_pdf = ARXIV_PDF_URL.format(paper_id=paper_id) if paper_id else ""
-
-        # Escape for HTML safety
-        title_h = html.escape(title) if title else "(no title)"
-        authors_short_h = html.escape(authors_short)
-        authors_full_h = html.escape(authors_full)
-
-        links = []
-        if hf_url:
-            links.append(f"<a href='{hf_url}' target='_blank' rel='noopener'>HF Paper</a>")
-        if arxiv_abs:
-            links.append(f"<a href='{arxiv_abs}' target='_blank' rel='noopener'>arXiv</a>")
-        if arxiv_pdf:
-            links.append(f"<a href='{arxiv_pdf}' target='_blank' rel='noopener'>PDF</a>")
-
-        cards_html.append("<div class='card'>")
-        cards_html.append(f"<div class='title'>{idx}. {title_h}</div>")
-        meta_bits = []
-        if upvotes is not None:
-            meta_bits.append(f"▲ {upvotes}")
-        if authors_short_h:
-            meta_bits.append(authors_short_h)
-        cards_html.append(f"<div class='meta'>{' · '.join(meta_bits)}</div>")
-
-        if links:
-            cards_html.append(f"<div class='links'>{' '.join(links)}</div>")
-
-        if keywords and isinstance(keywords, list):
-            badges = "".join([f"<span class='badge'>{html.escape(str(k))}</span>" for k in keywords[:12]])
-            cards_html.append(f"<div class='badges'>{badges}</div>")
-
-        # English bullets
-        if bullets_en:
-            cards_html.append("<div class='section'><h4>Key points (EN)</h4><ul>")
-            for b in bullets_en:
-                cards_html.append(f"<li>{html.escape(b)}</li>")
-            cards_html.append("</ul></div>")
-
-        # Japanese bullets
-        if bullets_ja:
-            cards_html.append("<div class='section'><h4>要点（日本語）</h4><ul>")
-            for b in bullets_ja:
-                cards_html.append(f"<li>{html.escape(b)}</li>")
-            cards_html.append("</ul></div>")
-        elif want_ja:
-            cards_html.append("<small class='note'>※ 翻訳が失敗したため日本語は省略（token 権限/モデル提供状況/一時障害を確認）</small>")
-
-        # Full authors collapsible
-        if authors_full_h and len(authors_full_h) > len(authors_short_h) + 10:
-            cards_html.append(
-                f"<details style='margin-top:10px;'><summary><small>Full authors</small></summary>"
-                f"<div class='meta' style='margin-top:6px;'>{authors_full_h}</div></details>"
+        cards.append(
+            render_card(
+                idx=idx,
+                paper_id=paper_id,
+                title=title,
+                upvotes=upvotes,
+                authors_short=authors_short,
+                authors_full=authors_full,
+                keywords=keywords,
+                points=points,
             )
+        )
 
-        cards_html.append("</div>")  # card
+    cards.append("</div>")
+    status = f"✅ Loaded {len(items)} papers for `{date_iso}` (UTC)."
+    return ("\n".join(cards), status)
 
-    cards_html.append("</div>")  # container
-    return ("\n".join(cards_html), status)
-
-# ---------- UI ----------
-def today_iso() -> str:
-    # HF Spaces runs in UTC by default; we keep it simple: today in UTC.
-    return dt.date.today().isoformat()
 
 with gr.Blocks() as demo:
-    gr.Markdown(f"# {APP_TITLE}\nHugging Face Daily Papers を指定日付で取得し、要点を表示します。")
+    gr.Markdown(f"# {APP_TITLE}\n{APP_DESCRIPTION}")
+
     with gr.Row():
-        date_in = gr.Textbox(label="Date (YYYY-MM-DD)", value=today_iso(), max_lines=1)
-        limit_in = gr.Slider(label="Limit", minimum=1, maximum=20, step=1, value=5)
-        lang_in = gr.Dropdown(
-            label="Output language",
-            choices=["English", "日本語（要約+翻訳）"],
-            value="English",
+        date_in = gr.Textbox(
+            label="Date (YYYY-MM-DD, UTC)",
+            value=utc_today_iso(),
+            max_lines=1,
+        )
+        limit_in = gr.Slider(
+            label="Limit",
+            minimum=1,
+            maximum=MAX_LIMIT,
+            step=1,
+            value=DEFAULT_LIMIT,
+        )
+        points_in = gr.Slider(
+            label="Key points per paper",
+            minimum=1,
+            maximum=MAX_POINTS,
+            step=1,
+            value=DEFAULT_POINTS,
         )
         run_btn = gr.Button("Run", variant="primary")
 
@@ -296,10 +317,9 @@ with gr.Blocks() as demo:
     html_out = gr.HTML()
 
     run_btn.click(
-        fn=build_cards,
-        inputs=[date_in, limit_in, lang_in],
+        fn=build_view,
+        inputs=[date_in, limit_in, points_in],
         outputs=[html_out, status_out],
     )
 
-# ✅ Gradio 6.x: theme/css are passed to launch(), not Blocks()
 demo.launch(theme=gr.themes.Soft(), css=CSS, ssr_mode=False)
