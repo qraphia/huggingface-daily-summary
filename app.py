@@ -1,21 +1,10 @@
-# app.py (simple / stable)
-# Hugging Face Daily Summary
-#
-# - Date -> fetch daily papers via huggingface_hub.HfApi
-# - Extractive bullets (pure python TF-IDF; no torch / no sklearn)
-# - Optional EN->JA translation via HF Inference (NLLB; fallback mBART)
-# - Cards + Table + Export
-#
-# Space Secret:
-# - HF_TOKEN (optional): enables translation; without it, translation is skipped (never crashes)
-
 import os
 import re
 import json
 import time
 import uuid
 import math
-import csv
+import logging
 import datetime as dt
 from pathlib import Path
 from functools import lru_cache
@@ -23,40 +12,65 @@ from typing import Any, Dict, List, Optional, Tuple
 from html import escape as html_escape
 
 import gradio as gr
+import pandas as pd
 from huggingface_hub import HfApi, InferenceClient
 
-APP_TITLE = "Hugging Face Daily Summary"
-TAGLINE = "Daily Papers → key points → (optional) Japanese"
 
-HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
+# =========================
+# Config
+# =========================
+APP_TITLE = "Hugging Face Daily Summary"
+TAGLINE = "Daily Papers → key points → optional Japanese translation (NLLB)"
 DEBUG = os.getenv("DEBUG", "0") == "1"
+
+# Space Secrets に設定する（Settings → Variables and secrets）
+HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
 
 EXPORT_DIR = Path("/tmp/hfds_exports")
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 ARXIV_ID_RE = re.compile(r"\b\d{4}\.\d{4,5}(v\d+)?\b")
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'\-]*")
-JA_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-JA_BETWEEN_SPACE_RE = re.compile(r"(?<=[\u3040-\u30ff\u3400-\u9fff])\s+(?=[\u3040-\u30ff\u3400-\u9fff])")
 
-# Better-than-OPUS defaults for technical EN->JA
-MT_PRIMARY = ("facebook/nllb-200-distilled-600M", "eng_Latn", "jpn_Jpan")
-MT_FALLBACK = ("facebook/mbart-large-50-many-to-many-mmt", "en_XX", "ja_XX")
+# 翻訳（OPUSは捨てる）
+TRANSLATION_MODEL = "facebook/nllb-200-distilled-600M"
+SRC_LANG = "eng_Latn"
+TGT_LANG = "jpn_Jpan"
+
+# 日本語空白の崩れを除去するための文字クラス
+JP_CHARS = r"\u3040-\u30FF\u3400-\u9FFF\uF900-\uFAFF"
 
 CSS = """
-.hfds-wrap{display:grid;gap:12px}
-.hfds-card{border:1px solid rgba(0,0,0,.12);border-radius:14px;padding:14px;background:rgba(255,255,255,.78)}
-.hfds-title{font-size:16px;font-weight:750;margin:0 0 6px 0;line-height:1.35}
-.hfds-meta{font-size:12px;opacity:.82;margin:0 0 8px 0;word-break:break-word}
-.hfds-links a{font-size:12px;margin-right:10px;text-decoration:none}
-.hfds-sec{margin:10px 0 4px 0;font-weight:700;font-size:13px}
-.hfds-ul{margin:0 0 6px 18px}
-.hfds-status{font-size:12px;opacity:.85}
+.hfds-wrap { display: grid; gap: 12px; }
+.hfds-card { border: 1px solid rgba(0,0,0,.12); border-radius: 14px; padding: 14px; background: rgba(255,255,255,.78); }
+.hfds-title { font-size: 16px; font-weight: 750; margin: 0 0 6px 0; line-height: 1.35; }
+.hfds-meta { font-size: 12px; opacity: .8; margin: 0 0 8px 0; white-space: normal; word-break: break-word; }
+.hfds-links { margin: 4px 0 0 0; }
+.hfds-links a { font-size: 12px; margin-right: 10px; text-decoration: none; }
+.hfds-sec { margin: 10px 0 4px 0; font-weight: 700; font-size: 13px; }
+.hfds-ul { margin: 0 0 6px 18px; }
+.hfds-status { font-size: 12px; opacity: .85; }
+.small-note { font-size: 12px; opacity: .7; }
 """
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s pid=%(process)d %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler()],
+    force=True,
+)
 
 api = HfApi()
 
+# 翻訳クライアントは1回だけ作る（毎回作ると遅い）
+_TRANSLATOR: Optional[InferenceClient] = None
+if HF_TOKEN:
+    _TRANSLATOR = InferenceClient(provider="hf-inference", token=HF_TOKEN, timeout=60)
 
+
+# =========================
+# Small helpers
+# =========================
 def rid() -> str:
     return uuid.uuid4().hex[:8]
 
@@ -71,12 +85,12 @@ def to_dict(x: Any) -> Dict[str, Any]:
 
 def first_nonempty(d: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
     for k in keys:
-        v = d.get(k)
+        v = d.get(k, None)
         if v is None:
             continue
         if isinstance(v, str) and v.strip():
             return v.strip()
-        if isinstance(v, list) and v:
+        if isinstance(v, list) and len(v) > 0:
             return v
     return default
 
@@ -104,7 +118,7 @@ def author_name(a: Any) -> str:
                 v = getattr(u, attr)
                 if isinstance(v, str) and v.strip():
                     return v.strip()
-    s = str(a)
+    s = str(a).strip()
     m = re.search(r"name='([^']+)'", s)
     return m.group(1).strip() if m else ""
 
@@ -114,13 +128,17 @@ def format_authors(authors_any: Any, max_names: int = 8) -> Tuple[str, str]:
     if isinstance(authors_any, str):
         names = [x.strip() for x in authors_any.split(",") if x.strip()]
     elif isinstance(authors_any, list):
-        names = [author_name(x) for x in authors_any if author_name(x)]
+        for a in authors_any:
+            n = author_name(a)
+            if n:
+                names.append(n)
     else:
         n = author_name(authors_any)
-        names = [n] if n else []
+        if n:
+            names = [n]
 
-    # de-dup preserve order
-    seen, uniq = set(), []
+    seen = set()
+    uniq = []
     for n in names:
         if n not in seen:
             seen.add(n)
@@ -129,7 +147,7 @@ def format_authors(authors_any: Any, max_names: int = 8) -> Tuple[str, str]:
     full = ", ".join(uniq)
     if len(uniq) <= max_names:
         return full, full
-    short = ", ".join(uniq[:max_names]) + f", et al. (+{len(uniq)-max_names})"
+    short = ", ".join(uniq[:max_names]) + f", et al. (+{len(uniq) - max_names})"
     return short, full
 
 
@@ -166,32 +184,35 @@ def arxiv_pdf_url(arxiv_id: Optional[str]) -> str:
 
 
 def best_text(p: Dict[str, Any]) -> str:
-    s = first_nonempty(p, ["abstract", "paperAbstract", "summary", "description", "content", "text"], default="") or ""
-    return s.strip()[:5000]
+    return first_nonempty(
+        p,
+        ["summary", "abstract", "paperAbstract", "description", "content", "text"],
+        default="",
+    ) or ""
 
 
+# =========================
+# Extractive summarization (simple TF-IDF-ish)
+# =========================
 def split_sentences(text: str) -> List[str]:
     text = (text or "").strip()
     if not text:
         return []
     sents = re.split(r"(?<=[.!?])\s+", text)
-    return [s.strip() for s in sents if s.strip()][:64]
+    return [s.strip() for s in sents if s.strip()]
 
 
 def tokenize(s: str) -> List[str]:
     return [w.lower() for w in WORD_RE.findall(s or "")]
 
 
-def extractive_bullets(text: str, k: int) -> List[str]:
+def extractive_bullets(text: str, k: int = 4) -> List[str]:
     sents = split_sentences(text)
-    if not sents:
-        return []
     if len(sents) <= k:
         return sents
 
     toks = [tokenize(s) for s in sents]
     N = len(sents)
-
     df: Dict[str, int] = {}
     for ts in toks:
         for t in set(ts):
@@ -200,13 +221,15 @@ def extractive_bullets(text: str, k: int) -> List[str]:
     def idf(t: str) -> float:
         return math.log((N + 1) / (df.get(t, 0) + 1)) + 1.0
 
-    doc_vec: Dict[str, float] = {}
     sent_vecs: List[Dict[str, float]] = []
+    doc_vec: Dict[str, float] = {}
+
     for ts in toks:
         tf: Dict[str, int] = {}
         for t in ts:
             tf[t] = tf.get(t, 0) + 1
         denom = max(1, len(ts))
+
         vec: Dict[str, float] = {}
         for t, c in tf.items():
             w = (c / denom) * idf(t)
@@ -214,7 +237,7 @@ def extractive_bullets(text: str, k: int) -> List[str]:
             doc_vec[t] = doc_vec.get(t, 0.0) + w
         sent_vecs.append(vec)
 
-    scores = []
+    scores: List[float] = []
     for vec in sent_vecs:
         s = 0.0
         for t, w in vec.items():
@@ -226,46 +249,16 @@ def extractive_bullets(text: str, k: int) -> List[str]:
     return [sents[i] for i in top_idx]
 
 
-def _postprocess_ja(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return s
-    s = JA_BETWEEN_SPACE_RE.sub("", s)
-    s = re.sub(r"\s+([、。！？])", r"\1", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _ja_ratio(s: str) -> float:
-    if not s:
-        return 0.0
-    return len(JA_CHAR_RE.findall(s)) / max(1, len(s))
-
-
-def translate_en_to_ja(text: str, client: InferenceClient) -> Optional[str]:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    for model, src, tgt in [MT_PRIMARY, MT_FALLBACK]:
-        out = client.translation(text, model=model, src_lang=src, tgt_lang=tgt)
-        if isinstance(out, str):
-            ja = out
-        else:
-            ja = getattr(out, "translation_text", None) or str(out)
-        ja = _postprocess_ja(ja)
-        if _ja_ratio(ja) < 0.02:
-            continue
-        return ja
-    return None
-
-
+# =========================
+# HF API (cached)
+# =========================
 @lru_cache(maxsize=512)
 def list_daily(date_str: str, limit: int, sort: str) -> List[Dict[str, Any]]:
     items = list(api.list_daily_papers(date=date_str, limit=limit, sort=sort))
     return [to_dict(x) for x in items]
 
 
-def find_latest_date(lookback_days: int = 45) -> Optional[str]:
+def find_latest_date(lookback_days: int = 30) -> Optional[str]:
     today = dt.date.today()
     for i in range(lookback_days + 1):
         d = (today - dt.timedelta(days=i)).isoformat()
@@ -277,15 +270,61 @@ def find_latest_date(lookback_days: int = 45) -> Optional[str]:
     return None
 
 
+# =========================
+# Translation (NLLB) + cleanup
+# =========================
+def _cleanup_ja(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    # remove spaces before punctuation (English & Japanese)
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    s = re.sub(r"\s+([、。])", r"\1", s)
+    s = re.sub(r"([、。])\s+", r"\1", s)
+    # remove spaces between Japanese characters
+    s = re.sub(fr"(?<=[{JP_CHARS}])\s+(?=[{JP_CHARS}])", "", s)
+    # collapse multiple spaces
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+
+@lru_cache(maxsize=8192)
+def translate_en_to_ja(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if _TRANSLATOR is None:
+        raise gr.Error(
+            "日本語翻訳を使うには、Space の Settings → Variables and secrets で "
+            "`HF_TOKEN` を Secret として設定してください（アカウントにトークンを作っただけでは環境変数に入りません）。"
+        )
+
+    out = _TRANSLATOR.translation(
+        text,
+        model=TRANSLATION_MODEL,
+        src_lang=SRC_LANG,
+        tgt_lang=TGT_LANG,
+        clean_up_tokenization_spaces=True,
+        generate_parameters={"max_new_tokens": 256, "num_beams": 4},
+    )
+    if isinstance(out, str):
+        return _cleanup_ja(out)
+    return _cleanup_ja(getattr(out, "translation_text", None) or str(out))
+
+
+# =========================
+# Rendering + Export
+# =========================
 def render_cards(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "<div class='hfds-status'>No results.</div>"
+
     parts = ["<div class='hfds-wrap'>"]
     for r in rows:
         title = html_escape(r.get("title", ""))
         authors_short = html_escape(r.get("authors_short", ""))
         authors_full = html_escape(r.get("authors_full", ""))
-        published = html_escape(r.get("published", ""))
+        published = html_escape(str(r.get("published", "")) or "")
 
         links = []
         if r.get("hf_url"):
@@ -298,15 +337,15 @@ def render_cards(rows: List[Dict[str, Any]]) -> str:
         parts.append("<div class='hfds-card'>")
         parts.append(f"<div class='hfds-title'>{r.get('rank','')}. {title}</div>")
 
-        meta = []
+        meta_bits = []
         if authors_short:
-            meta.append(f"<b>Authors:</b> {authors_short}")
+            meta_bits.append(f"<b>Authors:</b> {authors_short}")
         if published:
-            meta.append(f"<b>Published:</b> {published}")
-        if meta:
-            parts.append(f"<div class='hfds-meta'>{' • '.join(meta)}</div>")
+            meta_bits.append(f"<b>Published:</b> {published}")
+        if meta_bits:
+            parts.append(f"<div class='hfds-meta'>{' • '.join(meta_bits)}</div>")
         if authors_full and authors_full != authors_short:
-            parts.append(f"<div class='hfds-meta'>Full authors: {authors_full}</div>")
+            parts.append(f"<div class='small-note'>Full authors: {authors_full}</div>")
         if links:
             parts.append(f"<div class='hfds-links'>{' '.join(links)}</div>")
 
@@ -326,27 +365,35 @@ def render_cards(rows: List[Dict[str, Any]]) -> str:
             parts.append("</ul>")
 
         parts.append("</div>")
+
     parts.append("</div>")
     return "\n".join(parts)
 
 
-def rows_to_table(rows: List[Dict[str, Any]]) -> List[List[Any]]:
-    out = []
+def render_markdown(rows: List[Dict[str, Any]], date_str: str) -> str:
+    lines = [f"# {APP_TITLE} — {date_str}", ""]
     for r in rows:
-        out.append(
-            [
-                r.get("rank", ""),
-                r.get("title", ""),
-                r.get("authors_short", ""),
-                r.get("published", ""),
-                r.get("hf_url", ""),
-                r.get("arxiv_abs_url", ""),
-                r.get("pdf_url", ""),
-                "\n".join(r.get("bullets_en") or []),
-                "\n".join(r.get("bullets_ja") or []),
-            ]
-        )
-    return out
+        lines += [f"## {r.get('rank')}. {r.get('title','')}", ""]
+        lines += [
+            f"- HF: {r.get('hf_url','')}",
+            f"- arXiv: {r.get('arxiv_abs_url','')}",
+            f"- PDF: {r.get('pdf_url','')}",
+        ]
+        if r.get("authors_full"):
+            lines.append(f"- Authors: {r['authors_full']}")
+        if r.get("published"):
+            lines.append(f"- Published: {r['published']}")
+        lines += ["", "**Key points**", ""]
+        for b in (r.get("bullets_en") or []):
+            lines.append(f"- {b}")
+
+        if r.get("bullets_ja"):
+            lines += ["", "**要点（日本語）**", ""]
+            for b in (r.get("bullets_ja") or []):
+                lines.append(f"- {b}")
+
+        lines.append("")
+    return "\n".join(lines)
 
 
 def export_files(rows: List[Dict[str, Any]], date_str: str) -> Tuple[str, str, str]:
@@ -355,54 +402,39 @@ def export_files(rows: List[Dict[str, Any]], date_str: str) -> Tuple[str, str, s
     jsonl_path = EXPORT_DIR / f"hfdailysummary_{stamp}.jsonl"
     md_path = EXPORT_DIR / f"hfdailysummary_{stamp}.md"
 
-    cols = [
-        "date", "rank", "arxiv_id", "title", "authors_short", "authors_full", "published",
-        "hf_url", "arxiv_abs_url", "pdf_url", "bullets_en", "bullets_ja"
-    ]
-
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        for r in rows:
-            rr = dict(r)
-            rr["bullets_en"] = "\n".join(rr.get("bullets_en") or [])
-            rr["bullets_ja"] = "\n".join(rr.get("bullets_ja") or [])
-            w.writerow({c: rr.get(c, "") for c in cols})
+    df = pd.DataFrame(rows).copy()
+    for col in ["bullets_en", "bullets_ja"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: "\n".join(x) if isinstance(x, list) else (x or ""))
+    df.to_csv(csv_path, index=False)
 
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    lines = [f"# {APP_TITLE} — {date_str}", ""]
-    for r in rows:
-        lines.append(f"## {r.get('rank')}. {r.get('title','')}")
-        lines.append(f"- HF: {r.get('hf_url','')}")
-        lines.append(f"- arXiv: {r.get('arxiv_abs_url','')}")
-        lines.append(f"- PDF: {r.get('pdf_url','')}")
-        if r.get("authors_full"):
-            lines.append(f"- Authors: {r['authors_full']}")
-        if r.get("published"):
-            lines.append(f"- Published: {r['published']}")
-        lines.append("")
-        lines.append("**Key points**")
-        for b in (r.get("bullets_en") or []):
-            lines.append(f"- {b}")
-        if r.get("bullets_ja"):
-            lines.append("")
-            lines.append("**要点（日本語）**")
-            for b in (r.get("bullets_ja") or []):
-                lines.append(f"- {b}")
-        lines.append("")
+    md = render_markdown(rows, date_str)
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write(md)
 
     for p in [csv_path, jsonl_path, md_path]:
         if not p.is_file():
             raise gr.Error(f"Export failed: not a file: {p}")
+
     return str(csv_path.resolve()), str(jsonl_path.resolve()), str(md_path.resolve())
 
 
-def run(date_str: str, sort: str, limit: int, k: int, lang: str, top_n: int) -> Tuple[List[Dict[str, Any]], List[List[Any]], str, str]:
+# =========================
+# Pipeline
+# =========================
+def run_pipeline(
+    date_str: str,
+    limit: int,
+    sort: str,
+    k: int,
+    output_lang: str,
+    translate_top_n: int,
+    progress=gr.Progress(track_tqdm=False),
+) -> Tuple[List[Dict[str, Any]], pd.DataFrame, str, str]:
     _rid = rid()
     date_str = (date_str or "").strip()
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
@@ -410,20 +442,23 @@ def run(date_str: str, sort: str, limit: int, k: int, lang: str, top_n: int) -> 
 
     limit = int(limit)
     k = int(k)
-    top_n = int(top_n)
+    translate_top_n = int(translate_top_n)
 
+    progress(0, desc="Fetching Daily Papers…")
     base = list_daily(date_str, limit=limit, sort=sort)
 
     rows: List[Dict[str, Any]] = []
-    for p in base:
+    total = max(1, len(base))
+
+    for i, p in enumerate(base, start=1):
         arxiv_id = guess_arxiv_id(p)
-        title = safe = (first_nonempty(p, ["title"], default="") or "").strip()
+        title = first_nonempty(p, ["title"], default="")
         authors_any = first_nonempty(p, ["authors", "authorNames"], default=[])
         authors_short, authors_full = format_authors(authors_any, max_names=8)
-        published = (first_nonempty(p, ["publishedAt", "published_at", "published"], default="") or "").strip()
+        published = first_nonempty(p, ["publishedAt", "published_at", "published"], default="")
 
         text = best_text(p)
-        bullets_en = extractive_bullets(text, k=k)
+        bullets_en = extractive_bullets(text, k=k) if text else []
 
         rows.append(
             {
@@ -433,8 +468,8 @@ def run(date_str: str, sort: str, limit: int, k: int, lang: str, top_n: int) -> 
                 "title": title,
                 "authors_short": authors_short,
                 "authors_full": authors_full,
-                "published": published,
-                "hf_url": (first_nonempty(p, ["url", "paper_url", "hf_url"], default="") or "").strip() or hf_paper_url(arxiv_id),
+                "published": str(published),
+                "hf_url": first_nonempty(p, ["url", "paper_url", "hf_url"], default="") or hf_paper_url(arxiv_id),
                 "arxiv_abs_url": arxiv_abs_url(arxiv_id),
                 "pdf_url": arxiv_pdf_url(arxiv_id),
                 "bullets_en": bullets_en,
@@ -442,36 +477,46 @@ def run(date_str: str, sort: str, limit: int, k: int, lang: str, top_n: int) -> 
             }
         )
 
-    # optional translation
-    note = ""
-    if lang == "日本語":
-        if not HF_TOKEN:
-            note = "⚠️ HF_TOKEN 未設定のため翻訳はスキップ"
-        else:
-            client = InferenceClient(provider="hf-inference", token=HF_TOKEN, timeout=60)
-            n = min(max(0, top_n), len(rows))
-            for i in range(n):
-                ja_list = []
-                for b in rows[i]["bullets_en"]:
-                    try:
-                        ja = translate_en_to_ja(b, client)
-                        ja_list.append(ja if ja is not None else b)
-                    except Exception:
-                        ja_list.append(b)
-                rows[i]["bullets_ja"] = ja_list
+        progress(i / total)
 
-    cards = render_cards(rows)
-    table = rows_to_table(rows)
-    status = f"rid={_rid} rows={len(rows)} lang={lang}"
-    if note:
-        status += f"\n\n{note}"
-    return rows, table, cards, status
+    if not rows:
+        return [], pd.DataFrame(), "<div class='hfds-status'>No results.</div>", f"rid={_rid} no results"
+
+    if output_lang == "日本語":
+        top_n = min(max(0, translate_top_n), len(rows))
+        if top_n > 0:
+            progress(0, desc=f"Translating top {top_n} (NLLB)…")
+            for idx in range(top_n):
+                rows[idx]["bullets_ja"] = [translate_en_to_ja(b) for b in (rows[idx].get("bullets_en") or [])]
+                progress((idx + 1) / top_n)
+
+    cards_html = render_cards(rows)
+
+    df = pd.DataFrame(
+        [
+            {
+                "rank": r["rank"],
+                "title": r["title"],
+                "authors": r["authors_short"],
+                "published": r["published"],
+                "hf_url": r["hf_url"],
+                "arxiv": r["arxiv_abs_url"],
+                "pdf": r["pdf_url"],
+                "bullets_en": "\n".join(r.get("bullets_en") or []),
+                "bullets_ja": "\n".join(r.get("bullets_ja") or []),
+            }
+            for r in rows
+        ]
+    )
+
+    status = f"rid={_rid} rows={len(rows)} lang={output_lang}"
+    return rows, df, cards_html, status
 
 
-def latest() -> str:
-    d = find_latest_date(lookback_days=45)
+def set_latest_date() -> str:
+    d = find_latest_date(lookback_days=30)
     if not d:
-        raise gr.Error("直近45日で daily papers が見つかりませんでした。")
+        raise gr.Error("直近30日で daily papers が見つかりませんでした。")
     return d
 
 
@@ -481,6 +526,9 @@ def do_export(rows: List[Dict[str, Any]], date_str: str) -> Tuple[str, str, str]
     return export_files(rows, date_str)
 
 
+# =========================
+# UI
+# =========================
 with gr.Blocks(title=APP_TITLE) as demo:
     gr.Markdown(f"# {APP_TITLE}\n\n{TAGLINE}")
 
@@ -488,52 +536,42 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
     with gr.Row():
         date = gr.Textbox(label="Date (YYYY-MM-DD)", value=dt.date.today().isoformat(), scale=2)
-        btn_latest = gr.Button("Latest")
-        sort = gr.Dropdown(label="Sort", choices=["trending", "publishedAt"], value="trending")
+        btn_latest = gr.Button("Latest (API)", scale=1)
+        sort = gr.Dropdown(label="Sort", choices=["trending", "publishedAt"], value="trending", scale=1)
 
     with gr.Row():
-        limit = gr.Slider(label="Limit", minimum=5, maximum=200, step=5, value=50)
-        k = gr.Slider(label="Bullets", minimum=2, maximum=8, step=1, value=4)
+        limit = gr.Slider(label="Fetch limit", minimum=5, maximum=200, step=5, value=50)
+        k = gr.Slider(label="Bullets per paper", minimum=2, maximum=8, step=1, value=4)
 
     with gr.Row():
-        lang = gr.Dropdown(label="Language", choices=["English", "日本語"], value="English")
-        top_n = gr.Slider(label="Translate top N (if Japanese)", minimum=0, maximum=30, step=1, value=3)
+        output_lang = gr.Dropdown(label="Output language", choices=["English", "日本語"], value="English")
+        translate_top_n = gr.Slider(label="Translate top N papers", minimum=0, maximum=30, step=1, value=10)
+        run_btn = gr.Button("Run", variant="primary")
 
-    run_btn = gr.Button("Run", variant="primary")
     status = gr.Markdown("")
 
     with gr.Tab("Cards"):
         cards = gr.HTML()
 
     with gr.Tab("Table"):
-        table = gr.Dataframe(
-            headers=["rank", "title", "authors", "published", "hf_url", "arxiv", "pdf", "bullets_en", "bullets_ja"],
-            datatype=["number", "str", "str", "str", "str", "str", "str", "str", "str"],
-            wrap=True,
-            interactive=False,
-            row_count=(0, "dynamic"),
-            col_count=(9, "fixed"),
-        )
+        table = gr.Dataframe(wrap=True, interactive=False)
 
     with gr.Tab("Export"):
+        gr.Markdown("Run 後に Export を押すと、CSV / JSONL / Markdown を生成します。")
         export_btn = gr.Button("Export (CSV/JSONL/MD)")
         out_csv = gr.File(label="CSV")
         out_jsonl = gr.File(label="JSONL")
         out_md = gr.File(label="Markdown")
 
-    btn_latest.click(fn=latest, inputs=None, outputs=[date])
+    btn_latest.click(fn=set_latest_date, inputs=None, outputs=[date])
 
     run_btn.click(
-        fn=run,
-        inputs=[date, sort, limit, k, lang, top_n],
+        fn=run_pipeline,
+        inputs=[date, limit, sort, k, output_lang, translate_top_n],
         outputs=[state_rows, table, cards, status],
     )
 
-    export_btn.click(
-        fn=do_export,
-        inputs=[state_rows, date],
-        outputs=[out_csv, out_jsonl, out_md],
-    )
+    export_btn.click(fn=do_export, inputs=[state_rows, date], outputs=[out_csv, out_jsonl, out_md])
 
 demo.queue()
 
