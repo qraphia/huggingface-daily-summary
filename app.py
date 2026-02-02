@@ -18,7 +18,7 @@ import requests
 # =========================
 
 APP_TITLE = "Hugging Face Daily Summary"
-APP_SUBTITLE = "A glance-first briefing with full abstract + BibTeX."
+APP_SUBTITLE = "Glance-first daily briefing with full abstract + BibTeX."
 
 HF_DAILY_PAPERS_API = "https://huggingface.co/api/daily_papers"
 HF_PAPER_API = "https://huggingface.co/api/papers/{paper_id}"
@@ -42,7 +42,7 @@ HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
 SESSION = requests.Session()
 SESSION.headers.update(
     {
-        "User-Agent": "qraphia/huggingface-daily-summary (briefing; gradio)",
+        "User-Agent": "qraphia/huggingface-daily-summary (hf-style; gradio)",
         "Accept": "application/json",
     }
 )
@@ -61,11 +61,8 @@ RE_MAX_DATE = re.compile(r'must be less than or equal to "([^"]+)"')
 # Paper page HTML extraction (best-effort)
 RE_PROJECT_PAGE = re.compile(r'href="([^"]+)"[^>]*>\s*Project page\s*<', re.IGNORECASE)
 RE_GITHUB = re.compile(r'href="([^"]+github\.com[^"]+)"[^>]*>\s*GitHub\s*<', re.IGNORECASE)
-RE_MODELS = re.compile(r"Models citing this paper\s+(\d+)", re.IGNORECASE)
-RE_DATASETS = re.compile(r"Datasets citing this paper\s+(\d+)", re.IGNORECASE)
-RE_SPACES = re.compile(r"Spaces citing this paper\s+(\d+)", re.IGNORECASE)
 
-# HF brand colors (official): #FFD21E / #FF9D00 / #6B7280
+# HF brand colors: #FFD21E / #FF9D00 / #6B7280 (official)  https://huggingface.co/brand
 CSS = """
 :root{
   --hf-yellow:#FFD21E;
@@ -75,30 +72,32 @@ CSS = """
   --bg:#ffffff;
   --surface:#ffffff;
   --muted-bg:#f6f7f9;
-  --border:#e6e8ee;
+  --border:#e5e7eb;
+  --border-strong:#d1d5db;
+
   --text:#111827;
   --muted:#6B7280;
 
-  --shadow: 0 8px 28px rgba(17,24,39,0.08);
-  --shadow-sm: 0 3px 10px rgba(17,24,39,0.06);
+  --link:#0b5fff;
+  --shadow: 0 10px 30px rgba(17,24,39,0.10);
+  --shadow-sm: 0 4px 14px rgba(17,24,39,0.08);
 }
 
 body{
-  background: radial-gradient(900px 340px at 20% 0%, rgba(255,157,0,0.18), transparent 55%),
-              radial-gradient(800px 320px at 80% 0%, rgba(255,210,30,0.18), transparent 55%),
-              var(--bg);
+  background:
+    radial-gradient(900px 320px at 15% 0%, rgba(255,157,0,0.22), transparent 58%),
+    radial-gradient(900px 320px at 85% 0%, rgba(255,210,30,0.20), transparent 58%),
+    var(--bg);
   color: var(--text);
 }
-
 .gradio-container{ max-width: 1120px !important; }
 footer{ display:none !important; }
 
-/* Header */
 .hero{
-  margin: 14px 0 12px;
+  margin: 14px 0 10px;
   padding: 16px 16px;
-  border: 1px solid var(--border);
-  border-radius: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
   background: linear-gradient(180deg, #fff, #fff8e0);
   box-shadow: var(--shadow-sm);
 }
@@ -106,7 +105,6 @@ footer{ display:none !important; }
   margin:0;
   font-size: 1.55rem;
   letter-spacing:-0.02em;
-  color: var(--text);
 }
 .hero .sub{
   margin-top: 6px;
@@ -115,46 +113,41 @@ footer{ display:none !important; }
   line-height: 1.35;
 }
 
-/* Toolbar (sticky, compact, stylish) */
 #toolbar{
   position: sticky;
   top: 10px;
   z-index: 30;
   margin: 10px 0 10px;
-  padding: 12px 12px;
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  background: rgba(255,255,255,0.94);
+  padding: 10px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  background: rgba(255,255,255,0.96);
   backdrop-filter: blur(10px);
   box-shadow: var(--shadow);
 }
 
-#toolbar .gr-form{ background: transparent !important; border: none !important; box-shadow:none !important; }
-
 #toolbar input, #toolbar select{
-  border-radius: 12px !important;
-  border: 1px solid var(--border) !important;
+  border-radius: 14px !important;
+  border: 1px solid var(--border-strong) !important;
   background: #fff !important;
 }
 #toolbar input:focus, #toolbar select:focus{
-  border-color: rgba(255,157,0,0.55) !important;
+  border-color: rgba(255,157,0,0.60) !important;
   box-shadow: 0 0 0 4px rgba(255,157,0,0.18) !important;
 }
-
 #fetch_btn{
-  border-radius: 12px !important;
-  border: 1px solid rgba(255,157,0,0.55) !important;
+  border-radius: 14px !important;
+  border: 1px solid rgba(255,157,0,0.65) !important;
   background: linear-gradient(180deg, var(--hf-orange), #ffb84a) !important;
   color: #111827 !important;
-  font-weight: 900 !important;
-  box-shadow: 0 10px 18px rgba(255,157,0,0.22) !important;
+  font-weight: 950 !important;
+  box-shadow: 0 12px 22px rgba(255,157,0,0.24) !important;
 }
 #fetch_btn:hover{
   transform: translateY(-1px);
-  box-shadow: 0 14px 24px rgba(255,157,0,0.26) !important;
+  box-shadow: 0 16px 28px rgba(255,157,0,0.28) !important;
 }
 
-/* KPI row */
 .kpis{
   margin-top: 10px;
   display:flex;
@@ -166,16 +159,15 @@ footer{ display:none !important; }
   gap: 8px;
   align-items:center;
   padding: 6px 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: 999px;
-  background: var(--muted-bg);
-  color: var(--text);
+  background: rgba(255,255,255,0.70);
+  box-shadow: 0 1px 0 rgba(17,24,39,0.03);
   font-size: 0.90rem;
-  font-weight: 900;
+  font-weight: 950;
 }
-.kpi span{ color: var(--muted); font-weight: 900; }
+.kpi span{ color: var(--muted); font-weight: 950; }
 
-/* Highlights */
 .highlights{
   margin-top: 12px;
   display:grid;
@@ -186,8 +178,8 @@ footer{ display:none !important; }
   .highlights{ grid-template-columns: 1fr; }
 }
 .hcard{
-  border: 1px solid var(--border);
-  border-radius: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
   padding: 12px 12px;
   background: var(--surface);
   box-shadow: var(--shadow-sm);
@@ -196,7 +188,6 @@ footer{ display:none !important; }
   margin:0 0 8px;
   font-size: 0.95rem;
   letter-spacing: -0.01em;
-  color: var(--text);
 }
 .hitem{
   display:flex;
@@ -209,7 +200,7 @@ footer{ display:none !important; }
 .hitem a{
   color: var(--text);
   text-decoration:none;
-  font-weight: 900;
+  font-weight: 950;
   font-size: 0.92rem;
   line-height: 1.25;
   display:-webkit-box;
@@ -220,11 +211,10 @@ footer{ display:none !important; }
 .hitem a:hover{ text-decoration: underline; }
 .hval{
   color: var(--muted);
-  font-weight: 900;
+  font-weight: 950;
   white-space: nowrap;
 }
 
-/* Feed cards */
 .feed{
   margin-top: 14px;
   display:grid;
@@ -235,8 +225,8 @@ footer{ display:none !important; }
   .feed{ grid-template-columns: 1fr; }
 }
 .card{
-  border: 1px solid var(--border);
-  border-radius: 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 20px;
   padding: 14px 14px;
   background: var(--surface);
   box-shadow: var(--shadow-sm);
@@ -264,7 +254,7 @@ footer{ display:none !important; }
 .title{
   margin:0;
   color: var(--text);
-  font-weight: 950;
+  font-weight: 980;
   font-size: 1.02rem;
   line-height: 1.28;
   display:-webkit-box;
@@ -276,9 +266,9 @@ footer{ display:none !important; }
   padding: 6px 10px;
   border-radius: 999px;
   background: #fff7e6;
-  border: 1px solid rgba(255,157,0,0.35);
+  border: 1px solid rgba(255,157,0,0.40);
   color: #7a3d00;
-  font-weight: 950;
+  font-weight: 980;
   font-size: 0.86rem;
   white-space: nowrap;
 }
@@ -295,7 +285,7 @@ footer{ display:none !important; }
   background: var(--muted-bg);
   border: 1px solid var(--border);
   color: var(--text);
-  font-weight: 900;
+  font-weight: 950;
   font-size: 0.84rem;
 }
 .pill.dim{ color: var(--muted); }
@@ -307,7 +297,7 @@ footer{ display:none !important; }
 }
 .abs .label{
   color: var(--muted);
-  font-weight: 950;
+  font-weight: 980;
   font-size: 0.84rem;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -323,11 +313,73 @@ footer{ display:none !important; }
   overflow:hidden;
 }
 
+.links{
+  margin-top: 12px;
+  display:flex;
+  flex-wrap:wrap;
+  gap: 12px;
+  align-items: center;
+}
+.links a{
+  color: var(--link);
+  text-decoration:none;
+  font-weight: 980;
+  font-size: 0.92rem;
+}
+.links a:hover{ text-decoration: underline; }
+
+/* BibTeX popover next to GitHub */
+details.biblink{
+  position: relative;
+  display:inline-block;
+}
+details.biblink summary{
+  list-style: none;
+  cursor: pointer;
+  color: var(--link);
+  font-weight: 980;
+  font-size: 0.92rem;
+}
+details.biblink summary::-webkit-details-marker{ display:none; }
+details.biblink[open] summary{
+  text-decoration: underline;
+}
+.bibpop{
+  position:absolute;
+  right:0;
+  top: 26px;
+  z-index: 50;
+  width: min(560px, 78vw);
+  background: #0b1220;
+  color: #e5e7eb;
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 14px;
+  box-shadow: 0 16px 34px rgba(0,0,0,0.25);
+  padding: 10px;
+}
+.bibpop .hint{
+  color: rgba(229,231,235,0.72);
+  font-weight: 900;
+  font-size: 0.80rem;
+  margin-bottom: 8px;
+}
+pre.bib{
+  margin:0;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(0,0,0,0.55);
+  border: 1px solid rgba(255,255,255,0.10);
+  color: #e5e7eb;
+  overflow-x: auto;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
 details.more summary{
   cursor: pointer;
   margin-top: 12px;
-  color: #0b5fff;
-  font-weight: 950;
+  color: var(--link);
+  font-weight: 980;
   font-size: 0.90rem;
 }
 .moreblock{
@@ -341,31 +393,6 @@ details.more summary{
   line-height: 1.55;
   font-size: 0.95rem;
 }
-pre.bib{
-  margin-top: 10px;
-  padding: 10px;
-  border-radius: 14px;
-  background: #0b1220;
-  border: 1px solid rgba(17,24,39,0.20);
-  color: #e5e7eb;
-  overflow-x: auto;
-  font-size: 0.86rem;
-  line-height: 1.45;
-}
-
-.links{
-  margin-top: 12px;
-  display:flex;
-  flex-wrap:wrap;
-  gap: 10px;
-}
-.links a{
-  color: #0b5fff;
-  text-decoration:none;
-  font-weight: 950;
-  font-size: 0.92rem;
-}
-.links a:hover{ text-decoration: underline; }
 
 .error{
   border: 1px solid rgba(255,59,48,0.35);
@@ -400,9 +427,6 @@ class PaperExtras:
     project_page_url: Optional[str]
     github_repo_url: Optional[str]
     github_stars: Optional[int]
-    citing_models: Optional[int]
-    citing_datasets: Optional[int]
-    citing_spaces: Optional[int]
 
 
 # =========================
@@ -415,19 +439,35 @@ def esc(s: str) -> str:
 def utc_today_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).date().isoformat()
 
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
 def normalize_text(s: str) -> str:
     if not s:
         return ""
     out = s.replace("\r\n", "\n").replace("\r", "\n").strip()
-    for i in range(1, 120):
-        out = out.replace(f"L{i}:", "")
     while "\n\n\n" in out:
         out = out.replace("\n\n\n", "\n\n")
     return out.strip()
 
-def is_arxiv_id(paper_id: str) -> bool:
-    pid = (paper_id or "").strip()
-    return bool(RE_ARXIV_NEW.match(pid) or RE_ARXIV_OLD.match(pid))
+def is_arxiv_id(x: str) -> bool:
+    x = (x or "").strip()
+    return bool(RE_ARXIV_NEW.match(x) or RE_ARXIV_OLD.match(x))
+
+def normalize_ids(raw_id: str) -> Tuple[str, Optional[str]]:
+    """
+    Returns:
+      hf_id:  used for HF URLs (/papers/{hf_id})
+      arxiv_id: used for arXiv API / BibTeX, if available
+    """
+    rid = (raw_id or "").strip()
+    if rid.startswith("arxiv:"):
+        aid = rid.split(":", 1)[1].strip()
+        return aid, (aid if is_arxiv_id(aid) else None)
+    return rid, (rid if is_arxiv_id(rid) else None)
 
 def ensure_url(u: str) -> str:
     u = (u or "").strip()
@@ -489,11 +529,11 @@ def safe_get_text(url: str) -> Optional[str]:
         time.sleep(min(15.0, BACKOFF_BASE_S * (2 ** attempt)))
     return None
 
-def safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+def preview_text(s: str, max_chars: int = 640) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    return s if len(s) <= max_chars else s[: max_chars - 1].rstrip() + "…"
 
 
 # =========================
@@ -533,7 +573,7 @@ def fetch_hf_daily(date_iso: str, limit: int) -> Tuple[Optional[List[Dict[str, A
 
 
 # =========================
-# Paper extras (Project/GitHub/Hub assets counts)
+# Paper extras (Project/GitHub)
 # =========================
 
 def cache_get_extras(pid: str) -> Optional[PaperExtras]:
@@ -546,29 +586,17 @@ def cache_get_extras(pid: str) -> Optional[PaperExtras]:
 def cache_put_extras(pid: str, ex: PaperExtras) -> None:
     PAPER_EXTRAS_CACHE[pid] = (time.time(), ex)
 
-def extract_counts(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    def g(rx: re.Pattern) -> Optional[int]:
-        m = rx.search(text or "")
-        if not m:
-            return None
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return g(RE_MODELS), g(RE_DATASETS), g(RE_SPACES)
-
-def fetch_paper_extras(pid: str) -> PaperExtras:
-    pid = (pid or "").strip()
-    cached = cache_get_extras(pid)
+def fetch_paper_extras(hf_id: str) -> PaperExtras:
+    hf_id = (hf_id or "").strip()
+    cached = cache_get_extras(hf_id)
     if cached:
         return cached
 
     project_page_url: Optional[str] = None
     github_repo_url: Optional[str] = None
     github_stars: Optional[int] = None
-    cm = cd = cs = None
 
-    obj, err, _ = safe_get_json(HF_PAPER_API.format(paper_id=pid), None)
+    obj, err, _ = safe_get_json(HF_PAPER_API.format(paper_id=hf_id), None)
     if err is None and isinstance(obj, dict) and "error" not in obj:
         gr_repo = obj.get("githubRepo")
         if isinstance(gr_repo, str) and gr_repo.startswith("http") and "github.com" in gr_repo:
@@ -586,7 +614,7 @@ def fetch_paper_extras(pid: str) -> PaperExtras:
                 project_page_url = ensure_url(v.strip())
                 break
 
-    page = safe_get_text(HF_PAPER_PAGE.format(paper_id=pid))
+    page = safe_get_text(HF_PAPER_PAGE.format(paper_id=hf_id))
     if page:
         if project_page_url is None:
             m = RE_PROJECT_PAGE.search(page)
@@ -596,17 +624,9 @@ def fetch_paper_extras(pid: str) -> PaperExtras:
             m = RE_GITHUB.search(page)
             if m:
                 github_repo_url = ensure_url(m.group(1))
-        cm, cd, cs = extract_counts(page)
 
-    ex = PaperExtras(
-        project_page_url=project_page_url,
-        github_repo_url=github_repo_url,
-        github_stars=github_stars,
-        citing_models=cm,
-        citing_datasets=cd,
-        citing_spaces=cs,
-    )
-    cache_put_extras(pid, ex)
+    ex = PaperExtras(project_page_url=project_page_url, github_repo_url=github_repo_url, github_stars=github_stars)
+    cache_put_extras(hf_id, ex)
     return ex
 
 
@@ -614,14 +634,14 @@ def fetch_paper_extras(pid: str) -> PaperExtras:
 # arXiv meta (abstract + BibTeX)
 # =========================
 
-def cache_get_arxiv(aid: str) -> Optional[ArxivMeta]:
+def cache_get_arxiv(aid: str) -> Optional["ArxivMeta"]:
     hit = ARXIV_CACHE.get(aid)
     if not hit:
         return None
     ts, obj = hit
     return obj if (time.time() - ts < ARXIV_CACHE_TTL_S) else None
 
-def cache_put_arxiv(meta: ArxivMeta) -> None:
+def cache_put_arxiv(meta: "ArxivMeta") -> None:
     ARXIV_CACHE[meta.arxiv_id] = (time.time(), meta)
 
 def chunk(xs: List[str], n: int) -> List[List[str]]:
@@ -654,6 +674,7 @@ def fetch_arxiv_batch(arxiv_ids: List[str]) -> Dict[str, ArxivMeta]:
     result: Dict[str, ArxivMeta] = {}
     wanted: List[str] = []
     for aid in arxiv_ids:
+        aid = (aid or "").strip()
         if not aid or not is_arxiv_id(aid):
             continue
         cached = cache_get_arxiv(aid)
@@ -713,29 +734,16 @@ def format_authors(names: List[str], max_names: int = 8) -> str:
         return ", ".join(names)
     return ", ".join(names[:max_names]) + f", et al. (+{len(names) - max_names})"
 
-def preview_text(s: str, max_chars: int = 620) -> str:
-    s = (s or "").strip()
-    if not s:
-        return ""
-    return s if len(s) <= max_chars else s[: max_chars - 1].rstrip() + "…"
-
-def build_highlight_card(title: str, items_: List[Dict[str, Any]], metric: str) -> str:
+def build_highlight_card(title: str, items_: List[Dict[str, Any]]) -> str:
     if not items_:
-        return f"<div class='hcard'><h3>{esc(title)}</h3><div class='sub'>—</div></div>"
+        return f"<div class='hcard'><h3>{esc(title)}</h3><div style='color:var(--muted)'>—</div></div>"
     lines = []
     for r in items_:
-        pid = r["pid"]
-        href = HF_PAPER_PAGE.format(paper_id=pid) if pid else "#"
-        if metric == "upvotes":
-            val = str(r["upvotes"])
-        elif metric == "stars":
-            val = f"★ {r['stars']}"
-        else:
-            val = str(r["assets"])
+        href = HF_PAPER_PAGE.format(paper_id=r["hf_id"])
         lines.append(
             "<div class='hitem'>"
             f"<a href='{esc(href)}' target='_blank' rel='noopener'>{esc(r['title'])}</a>"
-            f"<div class='hval'>{esc(val)}</div>"
+            f"<div class='hval'>{esc(str(r['upvotes']))}</div>"
             "</div>"
         )
     return f"<div class='hcard'><h3>{esc(title)}</h3>{''.join(lines)}</div>"
@@ -764,46 +772,21 @@ def render(date_iso: str, limit_choice: str) -> Tuple[str, str]:
     if not items:
         return "<div class='feed'></div>", "No results."
 
-    # ids
-    paper_ids: List[str] = []
-    for it in items:
-        paper = (it or {}).get("paper") or {}
-        pid = str(paper.get("id") or it.get("id") or "").strip()
-        if pid:
-            paper_ids.append(pid)
-
-    # extras concurrent
-    extras_map: Dict[str, PaperExtras] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(fetch_paper_extras, pid): pid for pid in paper_ids}
-        for f in as_completed(futs):
-            pid = futs[f]
-            try:
-                extras_map[pid] = f.result()
-            except Exception:
-                extras_map[pid] = PaperExtras(None, None, None, None, None, None)
-
-    # arXiv meta
-    arxiv_ids = [pid for pid in paper_ids if is_arxiv_id(pid)]
-    arxiv_map = fetch_arxiv_batch(arxiv_ids)
-
-    # derived metrics
+    # Collect ids
     rows: List[Dict[str, Any]] = []
+    hf_ids: List[str] = []
+    arxiv_ids: List[str] = []
     upvotes_all: List[int] = []
     topic_counter: Dict[str, int] = {}
 
     for it in items:
         paper = (it or {}).get("paper") or {}
-        pid = str(paper.get("id") or it.get("id") or "").strip()
+        raw_id = str(paper.get("id") or it.get("id") or "").strip()
+        hf_id, arxiv_id = normalize_ids(raw_id)
+
         title = str(it.get("title") or paper.get("title") or "").strip() or "(no title)"
         up = safe_int(paper.get("upvotes"), 0)
         upvotes_all.append(up)
-
-        exx = extras_map.get(pid)
-        stars = exx.github_stars if (exx and exx.github_stars is not None) else None
-        assets = 0
-        if exx:
-            assets = safe_int(exx.citing_models, 0) + safe_int(exx.citing_datasets, 0) + safe_int(exx.citing_spaces, 0)
 
         kws = paper.get("ai_keywords") or []
         if isinstance(kws, list):
@@ -812,59 +795,42 @@ def render(date_iso: str, limit_choice: str) -> Tuple[str, str]:
                 if ks:
                     topic_counter[ks] = topic_counter.get(ks, 0) + 1
 
-        rows.append(
-            {
-                "pid": pid,
-                "title": title,
-                "upvotes": up,
-                "stars": stars,
-                "assets": assets,
-                "has_project": bool(exx and exx.project_page_url),
-                "has_github": bool(exx and exx.github_repo_url),
-            }
-        )
+        rows.append({"hf_id": hf_id, "arxiv_id": arxiv_id, "title": title, "upvotes": up, "paper": paper, "item": it})
+        if hf_id:
+            hf_ids.append(hf_id)
+        if arxiv_id:
+            arxiv_ids.append(arxiv_id)
 
-    # hot threshold (80th percentile)
+    # Extras concurrent
+    extras_map: Dict[str, PaperExtras] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(fetch_paper_extras, hf_id): hf_id for hf_id in hf_ids}
+        for f in as_completed(futs):
+            hf_id = futs[f]
+            try:
+                extras_map[hf_id] = f.result()
+            except Exception:
+                extras_map[hf_id] = PaperExtras(None, None, None)
+
+    # arXiv meta
+    arxiv_map = fetch_arxiv_batch(arxiv_ids)
+
+    # KPI / brief
+    total = len(rows)
+    with_project = 0
+    with_github = 0
+    for r in rows:
+        exx = extras_map.get(r["hf_id"])
+        if exx and exx.project_page_url:
+            with_project += 1
+        if exx and exx.github_repo_url:
+            with_github += 1
+
     up_sorted = sorted(upvotes_all)
     hot_threshold = up_sorted[max(0, int(0.80 * (len(up_sorted) - 1)))] if up_sorted else 0
 
-    total = len(items)
-    with_project = sum(1 for r in rows if r["has_project"])
-    with_github = sum(1 for r in rows if r["has_github"])
-    with_assets = sum(1 for r in rows if r["assets"] > 0)
     top_topics = sorted(topic_counter.items(), key=lambda kv: kv[1], reverse=True)[:6]
     topics_str = ", ".join([t for t, _ in top_topics]) if top_topics else "—"
-
-    # highlights (avoid duplicates across sections)
-    used: set = set()
-
-    top_up = []
-    for r in sorted(rows, key=lambda r: r["upvotes"], reverse=True):
-        if r["pid"] not in used:
-            top_up.append(r)
-            used.add(r["pid"])
-        if len(top_up) == 3:
-            break
-
-    top_star = []
-    for r in sorted(rows, key=lambda r: (r["stars"] if r["stars"] is not None else -1), reverse=True):
-        if r["stars"] is None:
-            continue
-        if r["pid"] not in used:
-            top_star.append(r)
-            used.add(r["pid"])
-        if len(top_star) == 3:
-            break
-
-    top_assets = []
-    for r in sorted(rows, key=lambda r: r["assets"], reverse=True):
-        if r["assets"] <= 0:
-            continue
-        if r["pid"] not in used:
-            top_assets.append(r)
-            used.add(r["pid"])
-        if len(top_assets) == 3:
-            break
 
     hero = (
         "<div class='hero'>"
@@ -874,37 +840,53 @@ def render(date_iso: str, limit_choice: str) -> Tuple[str, str]:
         f"<div class='kpi'><span>Total</span>{total}</div>"
         f"<div class='kpi'><span>Project page</span>{with_project}</div>"
         f"<div class='kpi'><span>GitHub</span>{with_github}</div>"
-        f"<div class='kpi'><span>Hub assets</span>{with_assets}</div>"
         f"<div class='kpi'><span>HOT ≥</span>{hot_threshold}</div>"
         f"<div class='kpi'><span>Top topics</span>{esc(topics_str)}</div>"
         "</div>"
         "</div>"
     )
 
+    # Highlights (replace broken "Most Hub Assets")
+    top_up = sorted(rows, key=lambda r: r["upvotes"], reverse=True)[:3]
+
+    with_proj = []
+    with_gh = []
+    for r in sorted(rows, key=lambda r: r["upvotes"], reverse=True):
+        exx = extras_map.get(r["hf_id"])
+        if exx and exx.project_page_url and len(with_proj) < 3:
+            with_proj.append(r)
+        if exx and exx.github_repo_url and len(with_gh) < 3:
+            with_gh.append(r)
+        if len(with_proj) >= 3 and len(with_gh) >= 3:
+            break
+
     highlights = (
         "<div class='highlights'>"
-        + build_highlight_card("Top Upvotes", top_up, "upvotes")
-        + build_highlight_card("Top GitHub Stars", top_star, "stars")
-        + build_highlight_card("Most Hub Assets", top_assets, "assets")
+        + build_highlight_card("Top Upvotes", top_up)
+        + build_highlight_card("Top with Project page", with_proj)
+        + build_highlight_card("Top with GitHub", with_gh)
         + "</div>"
     )
 
+    # Cards
     cards: List[str] = ["<div class='feed'>"]
-    for it in items:
-        paper = (it or {}).get("paper") or {}
-        pid = str(paper.get("id") or it.get("id") or "").strip()
+    for r in rows:
+        hf_id = r["hf_id"]
+        arxiv_id = r["arxiv_id"]
+        title = r["title"]
+        upvotes = r["upvotes"]
 
-        title = str(it.get("title") or paper.get("title") or "").strip() or "(no title)"
-        upvotes = safe_int(paper.get("upvotes"), 0)
+        paper = r["paper"]
+        it = r["item"]
 
-        meta = arxiv_map.get(pid)
+        exx = extras_map.get(hf_id)
+        meta = arxiv_map.get(arxiv_id) if arxiv_id else None
+
         authors = meta.authors if (meta and meta.authors) else get_hf_authors(paper)
         authors_text = format_authors(authors)
 
-        exx = extras_map.get(pid)
-
         full_abs = meta.abstract if (meta and meta.abstract) else normalize_text(str(it.get("summary") or paper.get("summary") or ""))
-        prev_abs = preview_text(full_abs, 620) if full_abs else ""
+        prev_abs = preview_text(full_abs, 640) if full_abs else ""
 
         pills = [
             "<span class='pill dim'>Authors</span>",
@@ -918,37 +900,43 @@ def render(date_iso: str, limit_choice: str) -> Tuple[str, str]:
             else:
                 pills.append("<span class='pill'>GitHub</span>")
 
-        if exx and (exx.citing_models is not None or exx.citing_datasets is not None or exx.citing_spaces is not None):
-            cm = "—" if exx.citing_models is None else str(exx.citing_models)
-            cd = "—" if exx.citing_datasets is None else str(exx.citing_datasets)
-            cs = "—" if exx.citing_spaces is None else str(exx.citing_spaces)
-            pills.append(f"<span class='pill'>Models {esc(cm)} · Datasets {esc(cd)} · Spaces {esc(cs)}</span>")
-
         cls = "card"
         if hot_threshold > 0 and upvotes >= hot_threshold:
             cls += " hot"
         if exx and (exx.project_page_url or exx.github_repo_url):
             cls += " oss"
 
+        # Links (BibTeX next to GitHub)
         links = []
-        if pid:
-            links.append(f"<a href='{esc(HF_PAPER_PAGE.format(paper_id=pid))}' target='_blank' rel='noopener'>HF page</a>")
-        if pid and is_arxiv_id(pid):
-            links.append(f"<a href='{esc(ARXIV_ABS.format(paper_id=pid))}' target='_blank' rel='noopener'>arXiv</a>")
-            links.append(f"<a href='{esc(ARXIV_PDF.format(paper_id=pid))}' target='_blank' rel='noopener'>PDF</a>")
+        if hf_id:
+            links.append(f"<a href='{esc(HF_PAPER_PAGE.format(paper_id=hf_id))}' target='_blank' rel='noopener'>HF page</a>")
+        if arxiv_id:
+            links.append(f"<a href='{esc(ARXIV_ABS.format(paper_id=arxiv_id))}' target='_blank' rel='noopener'>arXiv</a>")
+            links.append(f"<a href='{esc(ARXIV_PDF.format(paper_id=arxiv_id))}' target='_blank' rel='noopener'>PDF</a>")
         if exx and exx.project_page_url:
             links.append(f"<a href='{esc(exx.project_page_url)}' target='_blank' rel='noopener'>Project page</a>")
         if exx and exx.github_repo_url:
             links.append(f"<a href='{esc(exx.github_repo_url)}' target='_blank' rel='noopener'>GitHub</a>")
 
-        bib = build_bibtex(meta) if meta else ""
+        # BibTeX inline popover (only if arXiv meta exists)
+        if meta:
+            bib = build_bibtex(meta)
+            links.append(
+                "<details class='biblink'>"
+                "<summary>BibTeX</summary>"
+                "<div class='bibpop'>"
+                "<div class='hint'>Click outside to close</div>"
+                f"<pre class='bib'>{esc(bib)}</pre>"
+                "</div>"
+                "</details>"
+            )
+
         details = (
             "<details class='more'>"
-            "<summary>Details (full abstract + BibTeX)</summary>"
+            "<summary>Details (full abstract)</summary>"
             "<div class='moreblock'>"
             f"<div class='full'>{esc(full_abs) if full_abs else esc('Abstract not available.')}</div>"
-            + (f"<pre class='bib'>{esc(bib)}</pre>" if bib else "")
-            + "</div></details>"
+            "</div></details>"
         )
 
         cards.append(
@@ -971,7 +959,7 @@ def render(date_iso: str, limit_choice: str) -> Tuple[str, str]:
 
     page = hero + highlights + "".join(cards)
 
-    status = f"✅ Loaded {len(items)} paper(s) for {effective} (UTC)."
+    status = f"✅ Loaded {len(rows)} paper(s) for {effective} (UTC)."
     if effective != date_iso:
         status += f" (requested {date_iso} was not available yet; auto-clamped)"
     return page, status
@@ -990,18 +978,22 @@ def build_app() -> gr.Blocks:
 
         with gr.Row(elem_id="toolbar"):
             date_in = gr.Textbox(
-                label="Date (YYYY-MM-DD, UTC)",
+                label="",
+                show_label=False,
                 value=utc_today_iso(),
                 max_lines=1,
-                placeholder="e.g., 2026-01-30",
+                placeholder="Date (YYYY-MM-DD, UTC)  e.g., 2026-01-30",
+                scale=6,
             )
             limit_in = gr.Dropdown(
-                label="Limit",
+                label="",
+                show_label=False,
                 choices=["5", "10", "20", "30", "50"],
                 value="10",
                 allow_custom_value=False,
+                scale=2,
             )
-            fetch_btn = gr.Button("Fetch", variant="primary", elem_id="fetch_btn")
+            fetch_btn = gr.Button("Fetch", variant="primary", elem_id="fetch_btn", scale=2)
 
         status_out = gr.Markdown()
         html_out = gr.HTML()
